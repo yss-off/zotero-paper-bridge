@@ -58,8 +58,9 @@ def test_cli_offline_enqueue_then_online_drain(tmp_path: Path, monkeypatch, caps
     token = Path(init_out["token_path"]).read_text(encoding="utf-8").strip()
 
     # Point server TCP fallback to an unreachable port first -> offline mode
+    sock_literal = str(s_run_dir / "helper.sock")
     (s_cfg_dir / "config.toml").write_text(
-        f'socket_path = "{s_run_dir / "helper.sock"}"\ntcp_base_url = "http://127.0.0.1:1"\n',
+        f"socket_path = {json.dumps(sock_literal)}\ntcp_base_url = \"http://127.0.0.1:1\"\n",
         encoding="utf-8",
     )
 
@@ -98,7 +99,7 @@ def test_cli_offline_enqueue_then_online_drain(tmp_path: Path, monkeypatch, caps
     t.start()
     try:
         (s_cfg_dir / "config.toml").write_text(
-            f'socket_path = "{s_run_dir / "helper.sock"}"\ntcp_base_url = "http://127.0.0.1:{h_port}"\n',
+            f"socket_path = {json.dumps(sock_literal)}\ntcp_base_url = \"http://127.0.0.1:{h_port}\"\n",
             encoding="utf-8",
         )
 

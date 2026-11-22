@@ -6,6 +6,7 @@ import http.server
 import os
 import socket
 import socketserver
+import tempfile
 import threading
 from pathlib import Path
 
@@ -42,53 +43,55 @@ def test_desktop_notification_dispatches_safely(monkeypatch) -> None:
     os.name != "posix" or not hasattr(socket, "AF_UNIX"),
     reason="Unix Domain Socket test requires POSIX",
 )
-def test_mcp_bridge_client_headers_and_socket_reconnect(tmp_path: Path) -> None:
+def test_mcp_bridge_client_headers_and_socket_reconnect() -> None:
     pytest.importorskip("httpx")
-    sock_path = tmp_path / "zotero-read.sock"
-    seen_headers: list[str | None] = []
+    # Keep socket path short (<104 bytes) for macOS AF_UNIX sun_path limit
+    with tempfile.TemporaryDirectory(dir="/tmp", prefix="zpb-") as short_dir:
+        sock_path = Path(short_dir) / "z.sock"
+        seen_headers: list[str | None] = []
 
-    def _start_unix_server(tag: str):
-        if sock_path.exists():
-            sock_path.unlink()
+        def _start_unix_server(tag: str):
+            if sock_path.exists():
+                sock_path.unlink()
 
-        class Handler(http.server.BaseHTTPRequestHandler):
-            def log_message(self, format: str, *args: object) -> None:  # noqa: A002
-                return
+            class Handler(http.server.BaseHTTPRequestHandler):
+                def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+                    return
 
-            def do_GET(self) -> None:  # noqa: N802
-                seen_headers.append(self.headers.get("Zotero-API-Version"))
-                body = f'{{"generation":"{tag}"}}'.encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+                def do_GET(self) -> None:  # noqa: N802
+                    seen_headers.append(self.headers.get("Zotero-API-Version"))
+                    body = f'{{"generation":"{tag}"}}'.encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
 
-        class UnixServer(socketserver.ThreadingUnixStreamServer):
-            daemon_threads = True
+            class UnixServer(socketserver.ThreadingUnixStreamServer):
+                daemon_threads = True
 
-        srv = UnixServer(str(sock_path), Handler)
-        t = threading.Thread(target=srv.serve_forever, daemon=True)
-        t.start()
-        return srv
+            srv = UnixServer(str(sock_path), Handler)
+            t = threading.Thread(target=srv.serve_forever, daemon=True)
+            t.start()
+            return srv
 
-    srv1 = _start_unix_server("gen1")
-    with create_zotero_http_client(socket_path=sock_path, timeout=5.0) as client:
-        assert client.headers.get("Zotero-API-Version") == DEFAULT_ZOTERO_HEADERS["Zotero-API-Version"]
-        r1 = client.get("http://localhost:23119/api/users/0/collections")
-        assert r1.status_code == 200
-        assert r1.json() == {"generation": "gen1"}
+        srv1 = _start_unix_server("gen1")
+        with create_zotero_http_client(socket_path=sock_path, timeout=5.0) as client:
+            assert client.headers.get("Zotero-API-Version") == DEFAULT_ZOTERO_HEADERS["Zotero-API-Version"]
+            r1 = client.get("http://localhost:23119/api/users/0/collections")
+            assert r1.status_code == 200
+            assert r1.json() == {"generation": "gen1"}
 
-        # Simulate Windows SSH tunnel disconnect + stale socket removal + reconnect on new inode!
-        srv1.shutdown()
-        srv1.server_close()
-        srv2 = _start_unix_server("gen2")
-        try:
-            r2 = client.get("http://localhost:23119/api/users/0/collections")
-            assert r2.status_code == 200
-            assert r2.json() == {"generation": "gen2"}
-        finally:
-            srv2.shutdown()
-            srv2.server_close()
+            # Simulate SSH tunnel disconnect + stale socket removal + reconnect on new inode!
+            srv1.shutdown()
+            srv1.server_close()
+            srv2 = _start_unix_server("gen2")
+            try:
+                r2 = client.get("http://localhost:23119/api/users/0/collections")
+                assert r2.status_code == 200
+                assert r2.json() == {"generation": "gen2"}
+            finally:
+                srv2.shutdown()
+                srv2.server_close()
 
-    assert seen_headers == ["3", "3"]
+        assert seen_headers == ["3", "3"]

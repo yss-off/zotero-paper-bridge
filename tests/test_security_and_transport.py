@@ -7,6 +7,7 @@ import os
 import socket
 import socketserver
 import stat
+import tempfile
 import threading
 from pathlib import Path
 
@@ -79,41 +80,43 @@ def test_helper_http_server_auth_and_tcp_transport(tmp_path: Path) -> None:
     os.name != "posix" or not hasattr(socket, "AF_UNIX"),
     reason="Unix Domain Socket test requires POSIX",
 )
-def test_unix_domain_socket_transport(tmp_path: Path) -> None:
-    sock_dir = tmp_path / "run"
-    sock_dir.mkdir(mode=0o700)
-    sock_path = sock_dir / "helper.sock"
-    expected_token = "super-secret-token-for-unix-socket-test"
+def test_unix_domain_socket_transport() -> None:
+    # Keep socket path short (<104 bytes) for macOS AF_UNIX sun_path limit
+    with tempfile.TemporaryDirectory(dir="/tmp", prefix="zpb-") as short_dir:
+        sock_dir = Path(short_dir) / "r"
+        sock_dir.mkdir(mode=0o700)
+        sock_path = sock_dir / "h.sock"
+        expected_token = "super-secret-token-for-unix-socket-test"
 
-    class UnixHandler(http.server.BaseHTTPRequestHandler):
-        def log_message(self, format: str, *args: object) -> None:  # noqa: A002
-            return
+        class UnixHandler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+                return
 
-        def do_GET(self) -> None:  # noqa: N802
-            if not verify_bearer_header(self.headers.get("Authorization"), expected_token):
-                body = b'{"error":"unauthorized"}'
-                self.send_response(401)
-            else:
-                body = b'{"status":"ok","via":"unix_socket"}'
-                self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            def do_GET(self) -> None:  # noqa: N802
+                if not verify_bearer_header(self.headers.get("Authorization"), expected_token):
+                    body = b'{"error":"unauthorized"}'
+                    self.send_response(401)
+                else:
+                    body = b'{"status":"ok","via":"unix_socket"}'
+                    self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
 
-    class UnixHTTPServer(socketserver.ThreadingUnixStreamServer):
-        daemon_threads = True
+        class UnixHTTPServer(socketserver.ThreadingUnixStreamServer):
+            daemon_threads = True
 
-    srv = UnixHTTPServer(str(sock_path), UnixHandler)
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
-    try:
-        data = request_json("GET", "/health", token=expected_token, socket_path=sock_path)
-        assert data == {"status": "ok", "via": "unix_socket"}
+        srv = UnixHTTPServer(str(sock_path), UnixHandler)
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        try:
+            data = request_json("GET", "/health", token=expected_token, socket_path=sock_path)
+            assert data == {"status": "ok", "via": "unix_socket"}
 
-        with pytest.raises(HTTPStatusError) as exc_info:
-            request_json("GET", "/health", token="wrong-token-value-1234", socket_path=sock_path)
-        assert exc_info.value.status == 401
-    finally:
-        srv.shutdown()
-        srv.server_close()
+            with pytest.raises(HTTPStatusError) as exc_info:
+                request_json("GET", "/health", token="wrong-token-value-1234", socket_path=sock_path)
+            assert exc_info.value.status == 401
+        finally:
+            srv.shutdown()
+            srv.server_close()
