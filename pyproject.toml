@@ -13,11 +13,6 @@ authors = [
   { name = "Shuieng Yuan" },
 ]
 keywords = ["zotero", "mcp", "ieee", "arxiv", "ssh", "academic", "literature", "research"]
-
-[project.urls]
-Homepage = "https://github.com/yss-off/zotero-paper-bridge"
-Repository = "https://github.com/yss-off/zotero-paper-bridge"
-Issues = "https://github.com/yss-off/zotero-paper-bridge/issues"
 classifiers = [
   "Development Status :: 4 - Beta",
   "Intended Audience :: Science/Research",
@@ -32,6 +27,11 @@ classifiers = [
   "Programming Language :: Python :: 3.13",
 ]
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/yss-off/zotero-paper-bridge"
+Repository = "https://github.com/yss-off/zotero-paper-bridge"
+Issues = "https://github.com/yss-off/zotero-paper-bridge/issues"
 
 [project.optional-dependencies]
 mcp = [
