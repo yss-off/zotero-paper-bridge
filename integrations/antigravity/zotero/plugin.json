@@ -1,0 +1,15 @@
+{
+  "name": "zotero",
+  "displayName": "Zotero",
+  "version": "0.1.0",
+  "description": "Zotero 7 literature workflow: ingest IEEE/arXiv/DOI/BibTeX papers into local Zotero via reverse SSH (paper-bridge) and search or read full text back via private read-only MCP.",
+  "logo": "assets/logo.svg",
+  "author": "Shuieng Yuan",
+  "homepage": "https://github.com/yss-off/zotero-paper-bridge",
+  "repository": "https://github.com/yss-off/zotero-paper-bridge",
+  "suggestedPrompts": [
+    "检查 Zotero Paper Bridge 隧道状态并列出我的 Zotero 分类目录",
+    "把这篇 IEEE/arXiv 论文下载到 Zotero 的 Agent-Inbox 并读回全文总结要点",
+    "在我的 Zotero 文献库中检索相关论文并提取核心方法对比"
+  ]
+}

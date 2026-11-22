@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+export PYTHONPATH="${ROOT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
+
+choose_python() {
+  if [[ -n "${ZOTERO_MCP_PYTHON:-}" && -x "${ZOTERO_MCP_PYTHON}" ]]; then
+    printf '%s\n' "${ZOTERO_MCP_PYTHON}"
+    return 0
+  fi
+  if [[ -x "${HOME}/.local/share/uv/tools/zotero-mcp/bin/python" ]]; then
+    printf '%s\n' "${HOME}/.local/share/uv/tools/zotero-mcp/bin/python"
+    return 0
+  fi
+  if command -v zotero-mcp >/dev/null 2>&1; then
+    local zbin shebang interp
+    zbin="$(command -v zotero-mcp)"
+    shebang="$(head -n 1 "${zbin}" 2>/dev/null || true)"
+    if [[ "${shebang}" == "#!"* ]]; then
+      interp="${shebang#\#!}"
+      interp="${interp%% *}"
+      if [[ -x "${interp}" ]]; then
+        printf '%s\n' "${interp}"
+        return 0
+      fi
+    fi
+  fi
+  command -v python3
+}
+
+PYTHON_BIN="$(choose_python)"
+exec "${PYTHON_BIN}" -m paper_bridge.server.mcp_bridge "$@"

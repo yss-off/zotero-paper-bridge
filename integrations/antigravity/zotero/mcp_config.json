@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "library": {
+      "command": "zotero-mcp-paper-bridge",
+      "env": {
+        "ZOTERO_LOCAL": "true"
+      }
+    }
+  }
+}

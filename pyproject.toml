@@ -1,0 +1,64 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zotero-paper-bridge"
+version = "0.1.0"
+description = "Zero-dependency reverse-SSH bridge for ingesting IEEE/arXiv/DOI papers into local Zotero 7 and reading full text back on remote Linux servers via private MCP."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+authors = [
+  { name = "Shuieng Yuan" },
+]
+keywords = ["zotero", "mcp", "ieee", "arxiv", "ssh", "academic", "literature", "research"]
+
+[project.urls]
+Homepage = "https://github.com/yss-off/zotero-paper-bridge"
+Repository = "https://github.com/yss-off/zotero-paper-bridge"
+Issues = "https://github.com/yss-off/zotero-paper-bridge/issues"
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: MacOS",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
+dependencies = []
+
+[project.optional-dependencies]
+mcp = [
+  "httpx>=0.27",
+  "pyzotero>=1.6",
+  "zotero-mcp",
+]
+dev = [
+  "pytest>=8.0",
+  "ruff>=0.6",
+]
+
+[project.scripts]
+paper-bridge = "paper_bridge.server.cli:main"
+paper-bridge-helper = "paper_bridge.client.cli:main"
+zotero-mcp-paper-bridge = "paper_bridge.server.mcp_bridge:main"
+
+[tool.setuptools.packages.find]
+include = ["paper_bridge*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 110
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+ignore = ["E501"]
