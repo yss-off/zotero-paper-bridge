@@ -28,8 +28,20 @@ def build_readonly_proxy_server(
         def log_message(self, format: str, *args: object) -> None:  # noqa: A002
             return
 
+        def _drain_small_body(self) -> None:
+            # Drain small request bodies before closing so Windows Winsock sends FIN instead of RST (WinError 10053)
+            try:
+                length = int(self.headers.get("Content-Length") or "0")
+            except ValueError:
+                length = 0
+            if 0 < length <= 65536:
+                try:
+                    self.rfile.read(length)
+                except OSError:
+                    pass
+
         def _reject(self, code: int, msg: str) -> None:
-            # Close connection on rejected requests so unconsumed POST/PUT bodies never desync HTTP/1.1 keep-alive
+            self._drain_small_body()
             self.close_connection = True
             body = msg.encode("utf-8")
             self.send_response(code)

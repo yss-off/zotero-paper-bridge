@@ -62,6 +62,15 @@ def build_helper_http_server(
 
         def _require_auth(self) -> bool:
             if not verify_bearer_header(self.headers.get("Authorization"), token):
+                try:
+                    length = int(self.headers.get("Content-Length") or "0")
+                except ValueError:
+                    length = 0
+                if 0 < length <= 65536:
+                    try:
+                        self.rfile.read(length)
+                    except OSError:
+                        pass
                 self._send_json(
                     401,
                     {"error": "unauthorized", "message": "Missing or invalid Bearer token"},
