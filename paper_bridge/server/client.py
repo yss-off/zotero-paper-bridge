@@ -1,4 +1,4 @@
-"""Authenticated HTTP client from Ubuntu server to Windows helper over reverse SSH."""
+"""Authenticated HTTP client for talking to the local `paper-bridge-helper` daemon."""
 
 from __future__ import annotations
 
@@ -60,6 +60,9 @@ class PaperBridgeClient:
         wait_for_manual: bool = True,
         manual_timeout_sec: int = 300,
     ) -> dict[str, Any]:
+        timeout = self.config.request_timeout_sec
+        if wait_for_manual:
+            timeout = max(timeout, float(manual_timeout_sec) + 60.0)
         return self._call(
             "POST",
             "/v1/ingest",
@@ -71,6 +74,7 @@ class PaperBridgeClient:
                 "wait_for_manual": wait_for_manual,
                 "manual_timeout_sec": manual_timeout_sec,
             },
+            timeout=timeout,
         )
 
     def submit_batch(
@@ -79,15 +83,15 @@ class PaperBridgeClient:
         *,
         collection: str | None = None,
         tags: list[str] | None = None,
+        request_id: str | None = None,
     ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"items": items, "collection": collection, "tags": list(tags or [])}
+        if request_id is not None:
+            payload["request_id"] = request_id
         return self._call(
             "POST",
             "/v1/batches",
-            payload={
-                "items": items,
-                "collection": collection,
-                "tags": list(tags or []),
-            },
+            payload=payload,
             timeout=30.0,
         )
 

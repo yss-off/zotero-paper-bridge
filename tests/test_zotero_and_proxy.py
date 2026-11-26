@@ -5,14 +5,22 @@ from __future__ import annotations
 import http.client
 import http.server
 import json
+import os
+import socket
+import stat
+import tempfile
 import threading
 import uuid
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
+
+import pytest
 
 from paper_bridge.client.zotero_local import ZoteroLocalClient
 from paper_bridge.client.zotero_ro_proxy import start_readonly_proxy_thread
 from paper_bridge.common.models import Author, PaperMetadata
+from paper_bridge.common.transport import UnixHTTPConnection
 
 SAMPLE_PDF = b"%PDF-1.4\n" + (b"0123456789" * 200) + b"\n%%EOF\n"
 
@@ -333,3 +341,37 @@ def test_zotero_readonly_proxy_blocks_writes_and_connector() -> None:
         proxy_srv.server_close()
         srv.shutdown()
         srv.server_close()
+
+
+@pytest.mark.skipif(
+    os.name != "posix" or not hasattr(socket, "AF_UNIX"),
+    reason="Unix Domain Socket test requires POSIX",
+)
+def test_zotero_readonly_proxy_unix_socket() -> None:
+    state = MockZoteroState()
+    srv, base_url = start_mock_zotero(state)
+    with tempfile.TemporaryDirectory(dir="/tmp", prefix="zpb-") as short_dir:
+        sock_path = Path(short_dir) / "run" / "zotero-read.sock"
+        proxy_srv, _ = start_readonly_proxy_thread("127.0.0.1", 0, base_url, socket_path=sock_path)
+        try:
+            assert stat.S_IMODE(sock_path.parent.stat().st_mode) == 0o700
+            assert stat.S_IMODE(sock_path.lstat().st_mode) == 0o600
+
+            conn = UnixHTTPConnection(str(sock_path), timeout=5.0)
+            conn.request("GET", "/api/users/0/collections")
+            r = conn.getresponse()
+            body = json.loads(r.read().decode("utf-8"))
+            assert r.status == 200
+            assert len(body) == 2
+
+            conn.request("POST", "/connector/saveItems", body=b"{}", headers={"Content-Type": "application/json"})
+            r2 = conn.getresponse()
+            r2.read()
+            assert r2.status == 403
+            conn.close()
+        finally:
+            proxy_srv.shutdown()
+            proxy_srv.server_close()
+            srv.shutdown()
+            srv.server_close()
+        assert not sock_path.exists()

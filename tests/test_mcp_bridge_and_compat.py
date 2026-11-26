@@ -1,4 +1,4 @@
-"""Tests for MCP bridge reconnect resilience, headers, backward-compat shims, and cross-platform notifications."""
+"""Tests for MCP bridge reconnect resilience, headers, local defaults, and desktop notifications."""
 
 from __future__ import annotations
 
@@ -14,15 +14,32 @@ import pytest
 
 from paper_bridge.client import config as client_config
 from paper_bridge.client.handoff import show_desktop_notification
-from paper_bridge.server.mcp_bridge import DEFAULT_ZOTERO_HEADERS, create_zotero_http_client
-from paper_bridge.windows import cli as legacy_windows_cli
+from paper_bridge.server.mcp_bridge import (
+    DEFAULT_ZOTERO_HEADERS,
+    create_bridged_zotero_client,
+    create_zotero_http_client,
+    resolve_read_socket_path,
+)
 
 
-def test_backward_compat_windows_shim() -> None:
-    parser = legacy_windows_cli.build_parser()
-    args = parser.parse_args(["smoke-test"])
-    assert args.cmd == "smoke-test"
-    assert client_config.WindowsHelperConfig is client_config.ClientHelperConfig
+def test_client_config_defaults_to_private_unix_sockets_and_headless(tmp_path: Path) -> None:
+    cfg = client_config.ClientHelperConfig.load(tmp_path / "cfg")
+    run_dir = tmp_path / "home" / ".local" / "run" / "paper-bridge"
+    assert cfg.listen_socket == run_dir / "helper.sock"
+    assert cfg.zotero_ro_proxy_socket == run_dir / "zotero-read.sock"
+    assert cfg.open_browser_on_single_manual is False
+
+
+def test_client_inbox_defaults_to_isolated_home(tmp_path: Path) -> None:
+    config_dir = tmp_path / "config"
+    config = client_config.ClientHelperConfig(config_dir, config_dir / "token", config_dir / "config.toml")
+    expected_inbox = tmp_path / "home" / "Downloads" / "paper-bridge-inbox"
+    assert config.inbox_dir == expected_inbox
+    assert client_config.ClientHelperConfig.load(config_dir).inbox_dir == expected_inbox
+
+
+def test_mcp_read_socket_defaults_to_isolated_home(tmp_path: Path) -> None:
+    assert resolve_read_socket_path() == tmp_path / "home" / ".local/run/paper-bridge/zotero-read.sock"
 
 
 def test_desktop_notification_dispatches_safely(monkeypatch) -> None:
@@ -82,7 +99,7 @@ def test_mcp_bridge_client_headers_and_socket_reconnect() -> None:
             assert r1.status_code == 200
             assert r1.json() == {"generation": "gen1"}
 
-            # Simulate SSH tunnel disconnect + stale socket removal + reconnect on new inode!
+            # Simulate helper restart + stale socket removal + reconnect on new inode!
             srv1.shutdown()
             srv1.server_close()
             srv2 = _start_unix_server("gen2")
@@ -95,3 +112,46 @@ def test_mcp_bridge_client_headers_and_socket_reconnect() -> None:
                 srv2.server_close()
 
         assert seen_headers == ["3", "3"]
+
+
+def test_create_bridged_zotero_client_uses_independent_http_clients(monkeypatch: pytest.MonkeyPatch) -> None:
+    created: list[object] = []
+
+    class FakeHttpClient:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    class FakeZotero:
+        def __init__(self, library_id: str, library_type: str, *, local: bool, client: FakeHttpClient) -> None:
+            self.library_id = library_id
+            self.library_type = library_type
+            self.local = local
+            self.client = client
+
+        def __del__(self) -> None:
+            self.client.close()
+
+    def fake_create_http(**_kwargs: object) -> FakeHttpClient:
+        c = FakeHttpClient()
+        created.append(c)
+        return c
+
+    import sys
+    import types
+
+    fake_zotero_mod = types.SimpleNamespace(Zotero=FakeZotero)
+    fake_pkg = types.SimpleNamespace(zotero=fake_zotero_mod)
+    monkeypatch.setitem(sys.modules, "pyzotero", fake_pkg)
+    monkeypatch.setitem(sys.modules, "pyzotero.zotero", fake_zotero_mod)
+    monkeypatch.setattr("paper_bridge.server.mcp_bridge.create_zotero_http_client", fake_create_http)
+
+    z1 = create_bridged_zotero_client()
+    z2 = create_bridged_zotero_client()
+    assert z1.client is not z2.client
+    z1.client.close()
+    assert z1.client.closed is True
+    assert z2.client.closed is False
+    assert len(created) == 2

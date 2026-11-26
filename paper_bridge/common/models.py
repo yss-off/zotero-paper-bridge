@@ -1,4 +1,4 @@
-"""Data structures shared between the Ubuntu CLI and Windows desktop helper."""
+"""Data structures shared between the CLI and local Zotero helper daemon."""
 
 from __future__ import annotations
 
@@ -165,6 +165,17 @@ class IngestResult:
     manual_url: str | None = None
     reason: str = ""
     candidates: list[dict[str, Any]] = field(default_factory=list)
+    manual_task_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+def ingest_outcome(result: dict[str, Any]) -> str:
+    """Translate a paper result into the state of an offline queue entry."""
+    status = result.get("status")
+    if status == "failed":
+        return "failed"
+    if status in {"saved", "attached", "already_exists"} and result.get("pdf_attached"):
+        return "done"
+    return "needs_attention"

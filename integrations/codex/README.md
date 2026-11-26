@@ -1,6 +1,6 @@
 # OpenAI Codex CLI Integration
 
-## 1. Install `zotero-paper-bridge` on your remote Linux server
+## 1. Install `zotero-paper-bridge` on your Linux host (with local Zotero 7)
 
 ```bash
 ./scripts/install-server.sh --no-antigravity
@@ -8,7 +8,7 @@
 
 ## 2. Register the private read-only Zotero MCP server in `~/.codex/config.toml`
 
-Replace `<YOUR_HOME>` with your remote home directory (e.g. `/home/alice`):
+Replace `<YOUR_HOME>` with your home directory (e.g. `/home/alice`):
 
 ```toml
 [mcp_servers.zotero]

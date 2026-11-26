@@ -1,3 +1,3 @@
-"""Cross-project reverse-SSH literature ingestion bridge for Zotero 7."""
+"""Local Linux Zotero 7 literature ingestion daemon, CLI, and private read-only MCP bridge."""
 
 __version__ = "0.1.0"

@@ -4,14 +4,49 @@ from __future__ import annotations
 
 import http.client
 import json
+import os
 import socket
+import stat
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
 
+def prepare_unix_socket_path(socket_path: Path) -> Path:
+    """Create a private 0o700 parent directory and remove any stale socket at socket_path."""
+    if os.name != "posix" or not hasattr(socket, "AF_UNIX"):
+        raise RuntimeError("Unix Domain Sockets are only supported on POSIX systems")
+    path = socket_path.expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    try:
+        st = path.lstat()
+    except FileNotFoundError:
+        return path
+    if not stat.S_ISSOCK(st.st_mode):
+        raise ValueError(f"Refusing to overwrite non-socket path: {path}")
+    path.unlink()
+    return path
+
+
+def cleanup_unix_socket_path(socket_path: Path, *, expected_inode: int | None = None) -> None:
+    """Remove a bound Unix socket file only if it still matches this server's inode."""
+    try:
+        st = socket_path.lstat()
+    except FileNotFoundError:
+        return
+    if not stat.S_ISSOCK(st.st_mode):
+        return
+    if expected_inode is not None and st.st_ino != expected_inode:
+        return
+    try:
+        socket_path.unlink()
+    except FileNotFoundError:
+        return
+
+
 class TransportError(RuntimeError):
-    """Raised when the helper endpoint cannot be reached."""
+    """Raised when communication with the helper fails."""
 
 
 class HTTPStatusError(RuntimeError):
@@ -32,8 +67,12 @@ class UnixHTTPConnection(http.client.HTTPConnection):
 
     def connect(self) -> None:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(self.timeout)
-        sock.connect(self.socket_path)
+        try:
+            sock.settimeout(self.timeout)
+            sock.connect(self.socket_path)
+        except OSError:
+            sock.close()
+            raise
         self.sock = sock
 
 
@@ -74,6 +113,12 @@ def request_json(
         try:
             if kind == "unix":
                 conn = UnixHTTPConnection(target, timeout=timeout)
+                # Fall back only while we know no HTTP request has been sent.
+                try:
+                    conn.connect()
+                except (OSError, http.client.HTTPException) as exc:
+                    errors.append(f"{kind}:{target} -> {exc}")
+                    continue
                 req_path = path
             else:
                 parsed = urlparse(target)
@@ -91,10 +136,9 @@ def request_json(
             if not raw.strip():
                 return {}
             return json.loads(raw)
-        except HTTPStatusError:
-            raise
         except (OSError, http.client.HTTPException) as exc:
             errors.append(f"{kind}:{target} -> {exc}")
+            raise TransportError("; ".join(errors)) from exc
         finally:
             if conn is not None:
                 try:

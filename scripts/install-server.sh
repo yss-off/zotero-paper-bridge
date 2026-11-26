@@ -9,8 +9,9 @@ usage() {
   cat <<EOF
 Usage: $(basename "$0") [--with-antigravity | --no-antigravity] [--bin-dir DIR]
 
-Installs zotero-paper-bridge server commands into ~/.local/bin, initializes secure
-config/socket directories, and optionally installs the Antigravity Zotero plugin.
+Installs zotero-paper-bridge commands into ~/.local/bin, initializes local CLI and
+helper configs with a shared 256-bit Bearer token, and optionally installs the
+Antigravity Zotero plugin.
 EOF
 }
 
@@ -25,15 +26,19 @@ while [[ $# -gt 0 ]]; do
 done
 
 mkdir -p "${BIN_DIR}"
-chmod +x "${ROOT_DIR}/scripts/paper-bridge" "${ROOT_DIR}/scripts/zotero-mcp-paper-bridge"
+chmod +x "${ROOT_DIR}/scripts/paper-bridge" "${ROOT_DIR}/scripts/paper-bridge-helper" "${ROOT_DIR}/scripts/zotero-mcp-paper-bridge"
 ln -sfn "${ROOT_DIR}/scripts/paper-bridge" "${BIN_DIR}/paper-bridge"
+ln -sfn "${ROOT_DIR}/scripts/paper-bridge-helper" "${BIN_DIR}/paper-bridge-helper"
 ln -sfn "${ROOT_DIR}/scripts/zotero-mcp-paper-bridge" "${BIN_DIR}/zotero-mcp-paper-bridge"
 
 echo "[OK] Linked ${BIN_DIR}/paper-bridge -> ${ROOT_DIR}/scripts/paper-bridge"
+echo "[OK] Linked ${BIN_DIR}/paper-bridge-helper -> ${ROOT_DIR}/scripts/paper-bridge-helper"
 echo "[OK] Linked ${BIN_DIR}/zotero-mcp-paper-bridge -> ${ROOT_DIR}/scripts/zotero-mcp-paper-bridge"
 
 "${BIN_DIR}/paper-bridge" init >/dev/null
-echo "[OK] Initialized ~/.config/paper-bridge (token mode 600) and ~/.local/run/paper-bridge (mode 700)"
+TOKEN_VAL="$(cat "${HOME}/.config/paper-bridge/token")"
+"${BIN_DIR}/paper-bridge-helper" init --token "${TOKEN_VAL}" >/dev/null
+echo "[OK] Initialized ~/.config/paper-bridge, ~/.paper-bridge (shared token mode 600), and ~/.local/run/paper-bridge (mode 700)"
 
 if [[ "${INSTALL_ANTIGRAVITY}" == "auto" && -d "${HOME}/.gemini/config" ]]; then
   INSTALL_ANTIGRAVITY="yes"
@@ -67,6 +72,8 @@ fi
 
 echo ""
 echo "Next steps:"
-echo "  1. View your shared Bearer token:  cat ~/.config/paper-bridge/token"
-echo "  2. Build portable client bundle:   ${ROOT_DIR}/scripts/package-client-bundle.sh"
-echo "  3. Deploy on Windows/macOS/Linux client and run start-paper-bridge.ps1 (or .sh)."
+echo "  1. Enable Local API in local Zotero 7 (Settings -> Advanced -> Allow other applications...)."
+echo "  2. Set zotero_base_url in ~/.paper-bridge/config.toml if Zotero uses a custom port."
+echo "  3. Verify Zotero access: paper-bridge-helper smoke-test"
+echo "  4. Start the local helper daemon: paper-bridge-helper serve --no-browser"
+echo "     (or install scripts/paper-bridge-helper.service.example into ~/.config/systemd/user/)"

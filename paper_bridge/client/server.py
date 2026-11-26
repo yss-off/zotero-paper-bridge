@@ -1,15 +1,23 @@
-"""HTTP server for the Windows desktop helper (Bearer-authenticated loopback only)."""
+"""HTTP server for the local Zotero helper (Bearer-authenticated Unix socket or loopback)."""
 
 from __future__ import annotations
 
 import http.server
 import json
+import logging
+import os
+import socket
+import socketserver
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from ..common.models import IngestRequest
-from ..common.security import verify_bearer_header
+from ..common.security import is_loopback_host, verify_bearer_header
+from ..common.transport import cleanup_unix_socket_path, prepare_unix_socket_path
 from .engine import PaperBridgeEngine
+
+logger = logging.getLogger(__name__)
 
 
 def build_helper_http_server(
@@ -18,12 +26,27 @@ def build_helper_http_server(
     token: str,
     host: str | None = None,
     port: int | None = None,
-) -> http.server.ThreadingHTTPServer:
-    listen_host = host or engine.config.listen_host
+    socket_path: Path | None = None,
+) -> socketserver.BaseServer:
+    if socket_path is not None:
+        resolved_socket: Path | None = socket_path
+    elif host is not None or port is not None:
+        resolved_socket = None
+    else:
+        resolved_socket = engine.config.listen_socket
+    listen_host = engine.config.listen_host if host is None else host
+    if resolved_socket is None:
+        if not is_loopback_host(listen_host):
+            raise ValueError(f"listen_host must be a loopback host, got {listen_host!r}")
+        if listen_host.lower() == "localhost":
+            listen_host = "127.0.0.1"
     listen_port = port if port is not None else engine.config.listen_port
 
     class HelperRequestHandler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+
+        def address_string(self) -> str:
+            return self.client_address[0] if self.client_address else "unix"
 
         def log_message(self, format: str, *args: object) -> None:  # noqa: A002
             return
@@ -80,6 +103,22 @@ def build_helper_http_server(
             return True
 
         def do_GET(self) -> None:  # noqa: N802
+            try:
+                self._handle_get()
+            except Exception:
+                self._send_internal_error()
+
+        def do_POST(self) -> None:  # noqa: N802
+            try:
+                self._handle_post()
+            except Exception:
+                self._send_internal_error()
+
+        def _send_internal_error(self) -> None:
+            logger.exception("Paper Bridge helper failed to handle %s request", self.command)
+            self._send_json(500, {"error": "internal_error", "message": "Internal server error"}, close=True)
+
+        def _handle_get(self) -> None:
             parsed = urlparse(self.path)
             path = parsed.path
 
@@ -111,7 +150,7 @@ def build_helper_http_server(
 
             self._send_json(404, {"error": "not_found", "path": path})
 
-        def do_POST(self) -> None:  # noqa: N802
+        def _handle_post(self) -> None:
             parsed = urlparse(self.path)
             path = parsed.path
 
@@ -132,12 +171,16 @@ def build_helper_http_server(
 
             try:
                 body = self._read_json()
-            except (ValueError, json.JSONDecodeError) as exc:
-                self._send_json(400, {"error": "bad_request", "message": str(exc)})
+            except (ValueError, KeyError) as exc:
+                self._send_json(400, {"error": "bad_request", "message": str(exc)}, close=True)
                 return
 
             if path == "/v1/ingest":
-                req = IngestRequest.from_dict(body)
+                try:
+                    req = IngestRequest.from_dict(body)
+                except (ValueError, KeyError, TypeError, OverflowError) as exc:
+                    self._send_json(400, {"error": "bad_request", "message": str(exc)})
+                    return
                 result, _ = engine.ingest_one(req)
                 self._send_json(200, result.to_dict())
                 return
@@ -150,14 +193,28 @@ def build_helper_http_server(
                 identifiers = [str(x).strip() for x in items if str(x).strip()]
                 delay_raw = body.get("delay_range_sec")
                 delay_range = None
-                if isinstance(delay_raw, list) and len(delay_raw) == 2:
-                    delay_range = (float(delay_raw[0]), float(delay_raw[1]))
-                res = engine.submit_batch(
-                    identifiers,
-                    collection=body.get("collection") or None,
-                    tags=[str(t).strip() for t in (body.get("tags") or []) if str(t).strip()],
-                    delay_range_sec=delay_range,
-                )
+                request_id = body.get("request_id")
+                if request_id is not None and not isinstance(request_id, str):
+                    self._send_json(400, {"error": "bad_request", "message": "request_id must be a string"})
+                    return
+                try:
+                    if isinstance(delay_raw, list) and len(delay_raw) == 2:
+                        delay_range = (float(delay_raw[0]), float(delay_raw[1]))
+                    tags = [str(t).strip() for t in (body.get("tags") or []) if str(t).strip()]
+                except (TypeError, ValueError, OverflowError) as exc:
+                    self._send_json(400, {"error": "bad_request", "message": str(exc)})
+                    return
+                try:
+                    res = engine.submit_batch(
+                        identifiers,
+                        collection=body.get("collection") or None,
+                        tags=tags,
+                        delay_range_sec=delay_range,
+                        request_id=request_id,
+                    )
+                except ValueError as exc:
+                    self._send_json(400, {"error": "bad_request", "message": str(exc)})
+                    return
                 self._send_json(202, res)
                 return
 
@@ -174,7 +231,28 @@ def build_helper_http_server(
 
             self._send_json(404, {"error": "not_found", "path": path})
 
+    if resolved_socket is not None:
+        bound_path = prepare_unix_socket_path(resolved_socket)
+
+        class ReusableUnixHelperServer(socketserver.ThreadingUnixStreamServer):
+            daemon_threads = True
+            _bound_inode: int | None = None
+
+            def server_bind(self) -> None:
+                super().server_bind()
+                os.chmod(bound_path, 0o600)
+                self._bound_inode = bound_path.lstat().st_ino
+
+            def server_close(self) -> None:
+                try:
+                    super().server_close()
+                finally:
+                    cleanup_unix_socket_path(bound_path, expected_inode=self._bound_inode)
+
+        return ReusableUnixHelperServer(str(bound_path), HelperRequestHandler)
+
     class ReusableThreadingServer(http.server.ThreadingHTTPServer):
+        address_family = socket.AF_INET6 if ":" in listen_host else socket.AF_INET
         allow_reuse_address = True
         daemon_threads = True
 

@@ -22,8 +22,6 @@ jobs:
         run: pytest -v
       - name: Build Python sdist and wheel
         run: python -m build
-      - name: Build zero-dependency portable client bundle
-        run: ./scripts/package-client-bundle.sh
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -31,4 +29,3 @@ jobs:
           files: |
             dist/*.whl
             dist/*.tar.gz
-            dist/zotero-paper-bridge-client.zip

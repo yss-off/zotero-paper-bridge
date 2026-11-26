@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import signal
 import sys
+import threading
 from pathlib import Path
 
 from ..common.models import Author, PaperMetadata
-from ..common.security import ensure_token, load_token
+from ..common.security import ensure_token, is_loopback_host, load_token, write_token
 from .config import ClientHelperConfig
 from .engine import PaperBridgeEngine
 from .server import build_helper_http_server
@@ -31,9 +33,9 @@ def cmd_init(args: argparse.Namespace) -> int:
     cfg = ClientHelperConfig.load(Path(args.config_dir) if args.config_dir else None)
     cfg.ensure_initialized()
     if args.token:
-        cfg.token_path.write_text(args.token.strip() + "\n", encoding="utf-8")
-        created = True
         token = args.token.strip()
+        write_token(cfg.token_path, token)
+        created = True
     else:
         token, created = ensure_token(cfg.token_path)
 
@@ -47,39 +49,103 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 def cmd_serve(args: argparse.Namespace) -> int:
     cfg = ClientHelperConfig.load(Path(args.config_dir) if args.config_dir else None)
+    if args.socket:
+        listen_socket: Path | None = Path(args.socket).expanduser()
+    elif args.port is not None or args.host is not None:
+        listen_socket = None
+    else:
+        listen_socket = cfg.listen_socket
+
+    if args.ro_proxy_socket:
+        ro_proxy_socket: Path | None = Path(args.ro_proxy_socket).expanduser()
+    elif args.ro_proxy_port is not None:
+        ro_proxy_socket = None
+    else:
+        ro_proxy_socket = cfg.zotero_ro_proxy_socket
+
+    listen_host = cfg.listen_host if args.host is None else args.host
+    if listen_socket is None or args.host is not None or (
+        cfg.enable_zotero_ro_proxy and not args.no_ro_proxy and ro_proxy_socket is None
+    ):
+        for host in (cfg.listen_host, listen_host):
+            if not is_loopback_host(host):
+                raise ValueError(f"listen_host must be a loopback host, got {host!r}")
     cfg.ensure_initialized()
+    if args.port is not None:
+        cfg.listen_port = args.port
+    if args.ro_proxy_port is not None:
+        cfg.zotero_ro_proxy_port = args.ro_proxy_port
+    if args.zotero_url:
+        cfg.zotero_base_url = args.zotero_url.rstrip("/")
+    if args.no_browser:
+        cfg.open_browser_on_single_manual = False
+    cfg.listen_socket = listen_socket
+    cfg.zotero_ro_proxy_socket = ro_proxy_socket
+
     token = load_token(cfg.token_path)
     engine = PaperBridgeEngine(cfg)
 
     ro_server = None
     if cfg.enable_zotero_ro_proxy and not args.no_ro_proxy:
-        ro_server, _ = start_readonly_proxy_thread(
-            cfg.listen_host, cfg.zotero_ro_proxy_port, cfg.zotero_base_url
-        )
+        if ro_proxy_socket is not None:
+            ro_server, _ = start_readonly_proxy_thread(
+                cfg.listen_host,
+                cfg.zotero_ro_proxy_port,
+                cfg.zotero_base_url,
+                socket_path=ro_proxy_socket,
+            )
+            ro_endpoint = f"unix://{ro_proxy_socket}"
+        else:
+            ro_server, _ = start_readonly_proxy_thread(
+                cfg.listen_host, cfg.zotero_ro_proxy_port, cfg.zotero_base_url
+            )
+            ro_endpoint = f"http://{cfg.listen_host}:{cfg.zotero_ro_proxy_port}"
         print(
             f"[paper-bridge-helper] Read-only Zotero proxy listening on "
-            f"http://{cfg.listen_host}:{cfg.zotero_ro_proxy_port} -> {cfg.zotero_base_url} (GET /api/* only)",
+            f"{ro_endpoint} -> {cfg.zotero_base_url} (GET /api/* only)",
             flush=True,
         )
 
-    server = build_helper_http_server(
-        engine,
-        token=token,
-        host=args.host or cfg.listen_host,
-        port=args.port or cfg.listen_port,
-    )
+    if listen_socket is not None:
+        server = build_helper_http_server(
+            engine,
+            token=token,
+            socket_path=listen_socket,
+        )
+        helper_endpoint = f"unix://{listen_socket}"
+    else:
+        server = build_helper_http_server(
+            engine,
+            token=token,
+            host=listen_host,
+            port=cfg.listen_port,
+        )
+        if cfg.listen_port == 0:
+            cfg.listen_port = server.server_address[1]
+        helper_endpoint = f"http://{server.server_address[0]}:{server.server_address[1]}"
+
     h = engine.health()
     print(
-        f"[paper-bridge-helper] Helper API listening on http://{server.server_address[0]}:{server.server_address[1]} "
+        f"[paper-bridge-helper] Helper API listening on {helper_endpoint} "
         f"(zotero_alive={h['zotero_alive']}, local_api={h['zotero_local_api_ready']}, "
         f"collections={len(h['collections'])})",
         flush=True,
     )
+
+    prev_sigterm = None
+    if hasattr(signal, "SIGTERM") and threading.current_thread() is threading.main_thread():
+        def _handle_sigterm(_signum: int, _frame: object) -> None:
+            threading.Thread(target=server.shutdown, daemon=True).start()
+
+        prev_sigterm = signal.signal(signal.SIGTERM, _handle_sigterm)
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\n[paper-bridge-helper] Shutting down...", flush=True)
     finally:
+        if prev_sigterm is not None:
+            signal.signal(signal.SIGTERM, prev_sigterm)
         server.shutdown()
         server.server_close()
         if ro_server is not None:
@@ -91,6 +157,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
 def cmd_smoke_test(args: argparse.Namespace) -> int:
     """Phase 1 live verification against your local Zotero 7 Desktop."""
     cfg = ClientHelperConfig.load(Path(args.config_dir) if args.config_dir else None)
+    if args.zotero_url:
+        cfg.zotero_base_url = args.zotero_url.rstrip("/")
     zotero = ZoteroLocalClient(cfg.zotero_base_url)
     report: dict[str, object] = {"zotero_base_url": cfg.zotero_base_url}
 
@@ -161,23 +229,29 @@ def cmd_smoke_test(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="paper-bridge-helper",
-        description="Local Zotero 7 Paper Bridge Helper (Windows, macOS, Linux)",
+        description="Local Zotero 7 Paper Bridge Helper Daemon",
     )
     p.add_argument("--config-dir", default=None, help="Override config directory (default: ~/.paper-bridge)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     p_init = sub.add_parser("init", help="Initialize local config, inbox directory, and Bearer token")
-    p_init.add_argument("--token", default=None, help="Set explicit shared Bearer token from remote server")
+    p_init.add_argument("--token", default=None, help="Set explicit shared Bearer token from ~/.config/paper-bridge/token")
     p_init.add_argument("--print-token", action="store_true", help="Print the token to stdout")
     p_init.set_defaults(func=cmd_init)
 
-    p_serve = sub.add_parser("serve", help="Run the loopback HTTP helper (and optional read-only Zotero proxy)")
-    p_serve.add_argument("--host", default=None)
-    p_serve.add_argument("--port", type=int, default=None)
+    p_serve = sub.add_parser("serve", help="Run the local helper daemon and read-only Zotero proxy")
+    p_serve.add_argument("--host", default=None, help="Bind Helper API on a loopback TCP host instead of Unix socket")
+    p_serve.add_argument("--port", type=int, help="Bind Helper API on a loopback TCP port instead of Unix socket")
+    p_serve.add_argument("--socket", default=None, help="Bind Helper API on a private POSIX Unix Domain Socket")
+    p_serve.add_argument("--ro-proxy-port", type=int, help="Bind read-only Zotero proxy on a loopback TCP port")
+    p_serve.add_argument("--ro-proxy-socket", default=None, help="Bind read-only Zotero proxy on a private POSIX Unix Domain Socket")
+    p_serve.add_argument("--zotero-url", default=None, help="Override local Zotero base URL (e.g. http://127.0.0.1:23137)")
+    p_serve.add_argument("--no-browser", action="store_true", help="Disable interactive browser handoff wait")
     p_serve.add_argument("--no-ro-proxy", action="store_true")
     p_serve.set_defaults(func=cmd_serve)
 
     p_smoke = sub.add_parser("smoke-test", help="Verify Zotero 7 Local API and Connector write behavior")
+    p_smoke.add_argument("--zotero-url", default=None, help="Override local Zotero base URL")
     p_smoke.add_argument("--write-test", action="store_true", help="Create a tagged smoke-test item with PDF in Zotero")
     p_smoke.add_argument("--collection", default=None, help="Target collection for --write-test")
     p_smoke.add_argument(

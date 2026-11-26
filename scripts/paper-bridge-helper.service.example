@@ -1,0 +1,14 @@
+[Unit]
+Description=Zotero Paper Bridge Local Helper (Private Unix Socket Mode)
+After=network-online.target
+
+[Service]
+Type=simple
+UMask=0077
+Environment=SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+ExecStart=%h/.local/bin/paper-bridge-helper serve --no-browser
+Restart=on-failure
+RestartSec=3s
+
+[Install]
+WantedBy=default.target

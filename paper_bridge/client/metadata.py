@@ -14,6 +14,7 @@ from typing import Any
 
 from ..common.identifiers import extract_ieee_arnumber, normalize_doi, normalize_title
 from ..common.models import Author, PaperMetadata, ParsedIdentifier
+from ..common.security import build_ssl_context
 
 
 class AmbiguousTitleError(RuntimeError):
@@ -43,6 +44,7 @@ class MetadataResolver:
     def __init__(self, *, polite_email: str = "", timeout: float = 20.0) -> None:
         self.polite_email = polite_email.strip()
         self.timeout = timeout
+        self._ssl_context = build_ssl_context()
 
     def _user_agent(self) -> str:
         if self.polite_email:
@@ -58,7 +60,7 @@ class MetadataResolver:
             },
         )
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            with urllib.request.urlopen(req, timeout=self.timeout, context=self._ssl_context) as resp:
                 return resp.status, resp.read(), resp.geturl()
         except urllib.error.HTTPError as exc:
             return exc.code, exc.read(), url

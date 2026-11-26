@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from urllib.parse import urljoin, urlparse
 
 from ..common.models import PaperMetadata
-from ..common.security import is_safe_http_url
+from ..common.security import build_ssl_context, is_safe_http_url
 
 AUTH_URL_MARKERS = (
     "shibboleth",
@@ -116,12 +116,20 @@ def classify_non_pdf_response(status: int, final_url: str, body: bytes) -> tuple
     return "non_pdf_response", False
 
 
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not is_safe_http_url(newurl, require_academic_host=True):
+            raise urllib.error.HTTPError(req.full_url, 403, "Unsafe redirect target", headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 class TieredPaperFetcher:
     """Fetches PDFs politely without ever bypassing logins, paywalls, or anti-bot checks."""
 
     def __init__(self, *, polite_email: str = "", timeout: float = 30.0) -> None:
         self.polite_email = polite_email
         self.timeout = timeout
+        self._ssl_context = build_ssl_context()
 
     def _user_agent(self) -> str:
         if self.polite_email:
@@ -133,7 +141,7 @@ class TieredPaperFetcher:
         url: str,
         *,
         referer: str | None = None,
-        opener: urllib.request.OpenerDirector | None = None,
+        cookie_jar: http.cookiejar.CookieJar | None = None,
     ) -> tuple[int, bytes, str, str]:
         if not is_safe_http_url(url, require_academic_host=True):
             return 403, b"", url, ""
@@ -144,9 +152,15 @@ class TieredPaperFetcher:
         if referer:
             headers["Referer"] = referer
         req = urllib.request.Request(url, headers=headers)
-        open_fn = opener.open if opener is not None else urllib.request.urlopen
+        handlers: list[urllib.request.BaseHandler] = [
+            urllib.request.HTTPSHandler(context=self._ssl_context),
+            _SafeRedirectHandler(),
+        ]
+        if cookie_jar is not None:
+            handlers.append(urllib.request.HTTPCookieProcessor(cookie_jar))
+        opener = urllib.request.build_opener(*handlers)
         try:
-            with open_fn(req, timeout=self.timeout) as resp:
+            with opener.open(req, timeout=self.timeout) as resp:
                 return (
                     resp.status,
                     resp.read(),
@@ -154,7 +168,8 @@ class TieredPaperFetcher:
                     str(resp.headers.get("Content-Type") or ""),
                 )
         except urllib.error.HTTPError as exc:
-            return exc.code, exc.read(), exc.geturl(), str(exc.headers.get("Content-Type") or "")
+            with exc:
+                return exc.code, exc.read(), exc.geturl(), str(exc.headers.get("Content-Type") or "")
         except (urllib.error.URLError, OSError):
             return 0, b"", url, ""
 
@@ -213,10 +228,9 @@ class TieredPaperFetcher:
 
     def _fetch_ieee_campus_direct(self, arnumber: str, filename: str, landing: str) -> FetchOutcome:
         jar = http.cookiejar.CookieJar()
-        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
 
         direct_pdf_url = f"https://ieeexplore.ieee.org/stampPDF/getPDF.jsp?tp=&arnumber={arnumber}&ref="
-        status, body, final_url, _ = self._download(direct_pdf_url, referer=landing, opener=opener)
+        status, body, final_url, _ = self._download(direct_pdf_url, referer=landing, cookie_jar=jar)
         if status == 200 and is_valid_pdf(body):
             return FetchOutcome(
                 ok=True,
@@ -240,7 +254,7 @@ class TieredPaperFetcher:
         # Some campus networks serve the PDF inside stamp.jsp's iframe without an auth gate.
         # Make at most ONE polite follow-up if stamp.jsp exposes a direct ieeexplore.ieee.org PDF URL.
         stamp_url = f"https://ieeexplore.ieee.org/stamp/stamp.jsp?tp=&arnumber={arnumber}"
-        s_status, s_body, s_final_url, _ = self._download(stamp_url, referer=landing, opener=opener)
+        s_status, s_body, s_final_url, _ = self._download(stamp_url, referer=landing, cookie_jar=jar)
         if s_status == 200 and is_valid_pdf(s_body):
             return FetchOutcome(
                 ok=True,
@@ -268,7 +282,7 @@ class TieredPaperFetcher:
                 host = (urlparse(iframe_url).hostname or "").lower()
                 if host == "ieeexplore.ieee.org" or host.endswith(".ieee.org"):
                     p_status, p_body, p_final, _ = self._download(
-                        iframe_url, referer=stamp_url, opener=opener
+                        iframe_url, referer=stamp_url, cookie_jar=jar
                     )
                     if p_status == 200 and is_valid_pdf(p_body):
                         return FetchOutcome(

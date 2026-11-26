@@ -1,19 +1,23 @@
-"""Core Windows ingestion engine: dedup, metadata, tiered fetch, serial batching, manual handoff."""
+"""Core local ingestion engine: dedup, metadata, tiered fetch, serial batching, manual handoff."""
 
 from __future__ import annotations
 
+import json
+import logging
 import random
+import re
 import secrets
 import shutil
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
 from ..common.identifiers import parse_identifier
-from ..common.models import IngestRequest, IngestResult, PaperMetadata
+from ..common.models import Author, IngestRequest, IngestResult, PaperMetadata, ingest_outcome
+from ..common.persistence import atomic_write_text
 from .config import ClientHelperConfig
 from .fetcher import FetchOutcome, TieredPaperFetcher, sanitize_filename
 from .handoff import (
@@ -27,11 +31,15 @@ from .metadata import AmbiguousTitleError, MetadataResolver
 from .pdf_meta import extract_pdf_metadata
 from .zotero_local import ZoteroError, ZoteroLocalClient
 
+BATCH_ID = re.compile(r"batch-[0-9a-f]{10,32}")
+RESUMABLE_BATCH_STATES = {"queued", "running", "interrupted"}
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class BatchRecord:
     batch_id: str
-    state: str = "queued"  # queued | running | completed | completed_with_manual
+    state: str = "queued"
     collection: str | None = None
     tags: list[str] = field(default_factory=list)
     total: int = 0
@@ -41,8 +49,27 @@ class BatchRecord:
     local_nonce: str = field(default_factory=lambda: secrets.token_urlsafe(16))
     started_at: float = field(default_factory=time.time)
     finished_at: float | None = None
+    identifiers: list[str] = field(default_factory=list)
+    delay_min: float = 0.0
+    delay_max: float = 0.0
+    consecutive_ieee_blocks: int = 0
 
-    def summary_dict(self, *, helper_port: int) -> dict[str, Any]:
+    @classmethod
+    def from_file(cls, path: Path) -> "BatchRecord":
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        manual_items = []
+        for entry in payload.pop("manual_items"):
+            metadata = entry.pop("metadata")
+            metadata["creators"] = [Author.from_dict(x) for x in metadata["creators"]]
+            manual_items.append(PendingManualPaper(metadata=PaperMetadata(**metadata), **entry))
+        record = cls(manual_items=manual_items, **payload)
+        if record.batch_id != path.stem or record.total != len(record.identifiers):
+            raise ValueError("Batch record does not match its filename or input count")
+        if not 0 <= record.processed == len(record.results) <= record.total:
+            raise ValueError("Batch progress does not match its results")
+        return record
+
+    def summary_dict(self, *, helper_port: int | None) -> dict[str, Any]:
         counts: dict[str, int] = {}
         for r in self.results:
             st = str(r.get("status") or "unknown")
@@ -50,7 +77,7 @@ class BatchRecord:
         pending_manual = [m for m in self.manual_items if not m.completed]
         checklist_url = (
             f"http://127.0.0.1:{helper_port}/manual/{self.batch_id}?nonce={self.local_nonce}"
-            if self.manual_items
+            if self.manual_items and helper_port
             else None
         )
         return {
@@ -62,7 +89,7 @@ class BatchRecord:
             "counts": counts,
             "pending_manual_count": len(pending_manual),
             "manual_checklist_url": checklist_url,
-            "results": self.results,
+            "results": list(self.results),
         }
 
 
@@ -87,18 +114,37 @@ class PaperBridgeEngine:
         self.sleep_fn = sleep_fn
 
         self._lock = threading.Lock()
+        self._inbox_lock = threading.Lock()
         self._batches: dict[str, BatchRecord] = {}
         self._pending_manual: dict[str, PendingManualPaper] = {}
         self._processed_inbox_files: set[str] = set()
+        self._batch_dir = config.config_dir / "batches"
+        self._running_batches: set[str] = set()
+        for path in self._batch_dir.glob("batch-*.json"):
+            if not BATCH_ID.fullmatch(path.stem):
+                continue
+            try:
+                record = BatchRecord.from_file(path)
+            except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                logger.exception("Cannot read Paper Bridge batch %s", path.name)
+                continue
+            self._batches[record.batch_id] = record
+            self._pending_manual.update((entry.task_id, entry) for entry in record.manual_items)
+
+    def _save_batch(self, record: BatchRecord) -> None:
+        atomic_write_text(self._batch_dir / f"{record.batch_id}.json", json.dumps(asdict(record), ensure_ascii=False))
 
     def health(self) -> dict[str, Any]:
         z_alive = self.zotero.ping()
         local_api = self.zotero.local_api_ready() if z_alive else False
         collections = self.zotero.list_collections() if z_alive else []
+        with self._lock:
+            pending_count = sum(1 for p in self._pending_manual.values() if not p.completed)
         return {
             "status": "ok" if z_alive else "degraded",
             "zotero_alive": z_alive,
             "zotero_local_api_ready": local_api,
+            "durable_batches": True,
             "default_collection": self.config.default_collection,
             "inbox_dir": str(self.config.inbox_dir),
             "collections": [
@@ -109,7 +155,7 @@ class PaperBridgeEngine:
                 }
                 for c in collections
             ],
-            "pending_manual_count": sum(1 for p in self._pending_manual.values() if not p.completed),
+            "pending_manual_count": pending_count,
         }
 
     def ingest_one(
@@ -297,6 +343,7 @@ class PaperBridgeEngine:
             IngestResult(
                 identifier=req.identifier,
                 status="needs_manual",
+                manual_task_id=pending.task_id,
                 title=meta.title,
                 doi=meta.doi,
                 arxiv_id=meta.arxiv_id,
@@ -462,7 +509,7 @@ class PaperBridgeEngine:
         reason: str,
         tags: list[str],
     ) -> IngestResult:
-        """Open paper in real Windows browser, notify user, wait for Zotero Connector or inbox PDF."""
+        """Open paper in local browser, notify user, wait for Zotero Connector or inbox PDF."""
         self.config.inbox_dir.mkdir(parents=True, exist_ok=True)
         started = time.time() - 2.0
 
@@ -493,6 +540,7 @@ class PaperBridgeEngine:
                 arxiv_id=meta.arxiv_id,
                 ieee_arnumber=meta.ieee_arnumber,
                 title=meta.title,
+                prefer_with_pdf=True,
             )
             if match and match.has_pdf:
                 return IngestResult(
@@ -508,32 +556,33 @@ class PaperBridgeEngine:
                     reason="completed_via_browser_handoff",
                 )
 
-            # Signal 2: User clicked Download PDF into inbox_dir
-            pdf_file = find_matching_pdf_in_inbox(
-                self.config.inbox_dir,
-                pending,
-                seen_files=self._processed_inbox_files,
-                min_mtime=started,
-            )
-            if pdf_file is not None:
-                pdf_bytes = pdf_file.read_bytes()
-                manual_outcome = FetchOutcome(
-                    ok=True,
-                    pdf_bytes=pdf_bytes,
-                    pdf_url=manual_url,
-                    filename=sanitize_filename(meta.title),
-                    source="browser_download",
+            # Signal 2: Claim the inbox download under the same lock as batch scans.
+            with self._inbox_lock:
+                pdf_file = find_matching_pdf_in_inbox(
+                    self.config.inbox_dir,
+                    pending,
+                    seen_files=self._processed_inbox_files,
+                    min_mtime=started,
                 )
-                meta, manual_outcome, existing = self._enrich_metadata_from_pdf(meta, manual_outcome, existing)
-                res = self._commit_pdf_to_zotero(
-                    req=req,
-                    meta=meta,
-                    outcome=manual_outcome,
-                    existing=existing,
-                    tags=pending.tags,
-                )
-                self._archive_inbox_file(pdf_file)
-                return res
+                if pdf_file is not None:
+                    pdf_bytes = pdf_file.read_bytes()
+                    manual_outcome = FetchOutcome(
+                        ok=True,
+                        pdf_bytes=pdf_bytes,
+                        pdf_url=manual_url,
+                        filename=sanitize_filename(meta.title),
+                        source="browser_download",
+                    )
+                    meta, manual_outcome, existing = self._enrich_metadata_from_pdf(meta, manual_outcome, existing)
+                    res = self._commit_pdf_to_zotero(
+                        req=req,
+                        meta=meta,
+                        outcome=manual_outcome,
+                        existing=existing,
+                        tags=pending.tags,
+                    )
+                    self._archive_inbox_file(pdf_file)
+                    return res
 
             self.sleep_fn(min(2.0, max(0.05, deadline - time.time())))
 
@@ -573,47 +622,78 @@ class PaperBridgeEngine:
         collection: str | None = None,
         tags: list[str] | None = None,
         delay_range_sec: tuple[float, float] | None = None,
+        request_id: str | None = None,
     ) -> dict[str, Any]:
-        batch_id = f"batch-{uuid.uuid4().hex[:10]}"
+        batch_id = request_id or f"batch-{uuid.uuid4().hex[:10]}"
+        if not BATCH_ID.fullmatch(batch_id) or request_id == "":
+            raise ValueError("Invalid batch request ID")
+        d_min, d_max = delay_range_sec or (
+            self.config.batch_delay_min_sec,
+            self.config.batch_delay_max_sec,
+        )
         record = BatchRecord(
             batch_id=batch_id,
             state="queued",
             collection=collection,
             tags=list(tags or []),
             total=len(identifiers),
+            identifiers=list(identifiers),
+            delay_min=d_min,
+            delay_max=d_max,
         )
         with self._lock:
-            self._batches[batch_id] = record
+            stored = self._batches.get(batch_id)
+            if stored is None:
+                if (self._batch_dir / f"{batch_id}.json").exists():
+                    raise ValueError("Batch state could not be loaded")
+                self._save_batch(record)
+                self._batches[batch_id] = record
+            elif (stored.identifiers, stored.collection, stored.tags) != (
+                record.identifiers, record.collection, record.tags
+            ):
+                raise ValueError("Batch request ID already belongs to different input")
+            else:
+                record = stored
+            self._start_batch_locked(record)
+            return {"batch_id": batch_id, "accepted_count": record.total, "state": record.state}
 
-        d_min, d_max = delay_range_sec or (
-            self.config.batch_delay_min_sec,
-            self.config.batch_delay_max_sec,
-        )
-        worker = threading.Thread(
-            target=self._run_batch_worker,
-            args=(record, identifiers, d_min, d_max),
-            name=f"paper-bridge-{batch_id}",
-            daemon=True,
-        )
-        worker.start()
-        return {
-            "batch_id": batch_id,
-            "accepted_count": len(identifiers),
-            "state": "queued",
-        }
+    def _start_batch_locked(self, record: BatchRecord) -> None:
+        if record.state in RESUMABLE_BATCH_STATES and record.batch_id not in self._running_batches:
+            threading.Thread(
+                target=self._run_batch_worker,
+                args=(record,),
+                name=f"paper-bridge-{record.batch_id}",
+                daemon=True,
+            ).start()
+            self._running_batches.add(record.batch_id)
+            if record.state == "interrupted":
+                record.state = "queued"
 
     def _run_batch_worker(
         self,
         record: BatchRecord,
-        identifiers: list[str],
-        delay_min: float,
-        delay_max: float,
     ) -> None:
-        record.state = "running"
-        consecutive_ieee_blocks = 0
+        stopped = False
+        try:
+            with self._lock:
+                record.state = "running"
+            self._process_batch(record)
+        except Exception:
+            stopped = True
+            logger.exception("Paper Bridge batch %s stopped", record.batch_id)
+        finally:
+            with self._lock:
+                self._running_batches.discard(record.batch_id)
+                if stopped:
+                    if record.state in RESUMABLE_BATCH_STATES:
+                        record.state = "interrupted"
+                    try:
+                        self._save_batch(record)
+                    except Exception:
+                        logger.exception("Cannot persist Paper Bridge batch %s after worker stopped", record.batch_id)
 
-        for idx, ident in enumerate(identifiers):
-            skip_ieee = consecutive_ieee_blocks >= self.config.ieee_circuit_breaker_threshold
+    def _process_batch(self, record: BatchRecord) -> None:
+        for ident in record.identifiers[record.processed:]:
             req = IngestRequest(
                 identifier=ident,
                 collection=record.collection,
@@ -621,46 +701,73 @@ class PaperBridgeEngine:
                 mode="batch",
                 wait_for_manual=False,
             )
-            res, hit_rl = self.ingest_one(req, skip_silent_ieee=skip_ieee, batch_id=record.batch_id)
-            if hit_rl:
-                consecutive_ieee_blocks += 1
-            elif res.source == "ieee_campus" and res.pdf_attached:
-                consecutive_ieee_blocks = 0
-
+            skip_ieee = record.consecutive_ieee_blocks >= self.config.ieee_circuit_breaker_threshold
+            try:
+                res, hit_rl = self.ingest_one(req, skip_silent_ieee=skip_ieee, batch_id=record.batch_id)
+            except Exception as exc:
+                logger.exception("Paper Bridge batch %s failed at paper %d", record.batch_id, record.processed + 1)
+                res = IngestResult(identifier=ident, status="failed", reason=f"unexpected_ingest_error: {type(exc).__name__}")
+                hit_rl = False
             with self._lock:
+                if res.reason == "zotero_not_running":
+                    record.state = "queued"
+                    return
+                if hit_rl:
+                    record.consecutive_ieee_blocks += 1
+                elif res.source == "ieee_campus" and res.pdf_attached:
+                    record.consecutive_ieee_blocks = 0
                 record.results.append(res.to_dict())
                 record.processed += 1
+                self._save_batch(record)
 
-            # Polite jittered delay between network fetches (skip delay if already in Zotero)
-            if idx + 1 < len(identifiers) and res.source != "zotero_existing" and delay_max > 0:
-                delay = random.uniform(max(0.0, delay_min), max(delay_min, delay_max))
+            if record.processed < record.total and res.source != "zotero_existing" and record.delay_max > 0:
+                delay = random.uniform(max(0.0, record.delay_min), max(record.delay_min, record.delay_max))
                 self.sleep_fn(delay)
 
-        record.finished_at = time.time()
-        if record.manual_items:
+        with self._lock:
+            record.finished_at = time.time()
+            self._finish_batch_locked(record)
+        if record.state == "completed_with_manual":
+            if self.config.listen_socket is None:
+                self.open_manual_checklist(record.batch_id)
+        else:
+            successes = sum(ingest_outcome(result) == "done" for result in record.results)
+            self.notifier(
+                "文献批量汇总结束",
+                f"批次 {record.batch_id} 已完成 {successes}/{record.total} 篇，详情见批次状态。",
+            )
+
+    def _finish_batch_locked(self, record: BatchRecord) -> None:
+        if any(not item.completed for item in record.manual_items):
             record.state = "completed_with_manual"
-            self.open_manual_checklist(record.batch_id)
+        elif any(ingest_outcome(result) != "done" for result in record.results):
+            record.state = "completed_with_errors"
         else:
             record.state = "completed"
-            self.notifier(
-                "文献批量汇总完成",
-                f"批次 {record.batch_id} 共 {record.total} 篇已全部静默入库 Zotero。",
-            )
+        self._save_batch(record)
 
     def get_batch(self, batch_id: str) -> dict[str, Any] | None:
         with self._lock:
             rec = self._batches.get(batch_id)
             if rec is None:
                 return None
-            return rec.summary_dict(helper_port=self.config.listen_port)
+            self._start_batch_locked(rec)
+            helper_port = None if self.config.listen_socket is not None else self.config.listen_port
+            return rec.summary_dict(helper_port=helper_port)
 
     def open_manual_checklist(self, batch_id: str) -> dict[str, Any]:
         with self._lock:
             rec = self._batches.get(batch_id)
         if rec is None:
             return {"ok": False, "reason": "batch_not_found"}
-        url = f"http://127.0.0.1:{self.config.listen_port}/manual/{batch_id}?nonce={rec.local_nonce}"
         pending_count = sum(1 for m in rec.manual_items if not m.completed)
+        if self.config.listen_socket is not None:
+            return {
+                "ok": False,
+                "reason": "unix_socket_mode_no_browser_checklist",
+                "pending_count": pending_count,
+            }
+        url = f"http://127.0.0.1:{self.config.listen_port}/manual/{batch_id}?nonce={rec.local_nonce}"
         self.notifier(
             "批量下载完成，有文献待补 PDF",
             f"批次 {batch_id} 中有 {pending_count} 篇需要浏览器验证/登录，点击打开待补清单。",
@@ -691,54 +798,81 @@ class PaperBridgeEngine:
 
     def scan_inbox_and_attach(self, *, batch_id: str | None = None) -> dict[str, Any]:
         """Match manually downloaded PDFs in inbox_dir against pending `needs-pdf` items."""
+        with self._inbox_lock:
+            return self._scan_inbox_and_attach(batch_id)
+
+    def _scan_inbox_and_attach(self, batch_id: str | None) -> dict[str, Any]:
         self.config.inbox_dir.mkdir(parents=True, exist_ok=True)
         with self._lock:
             candidates = [
                 p
                 for p in self._pending_manual.values()
-                if not p.completed and (batch_id is None or p.batch_id == batch_id)
+                if not p.completed
+                and (batch_id is None or p.batch_id == batch_id)
+                and (p.batch_id not in self._batches or self._batches[p.batch_id].finished_at is not None)
             ]
 
         attached: list[dict[str, Any]] = []
+        errors: list[dict[str, str]] = []
         for pending in candidates:
-            pdf_file = find_matching_pdf_in_inbox(
-                self.config.inbox_dir,
-                pending,
-                seen_files=self._processed_inbox_files,
-            )
-            if pdf_file is None:
+            try:
+                pdf_file = find_matching_pdf_in_inbox(
+                    self.config.inbox_dir,
+                    pending,
+                    seen_files=self._processed_inbox_files,
+                )
+                if pdf_file is None:
+                    continue
+                pdf_bytes = pdf_file.read_bytes()
+                if pending.item_key:
+                    res = self.zotero.attach_pdf_to_existing(
+                        pending.item_key,
+                        pdf_bytes,
+                        pdf_filename=sanitize_filename(pending.metadata.title),
+                        pdf_url=pending.manual_url,
+                        metadata=pending.metadata,
+                        collection_name=pending.collection,
+                        default_collection=self.config.default_collection,
+                        tags=pending.tags + ["pdf-attached"],
+                    )
+                else:
+                    saved = self.zotero.save_item(
+                        pending.metadata,
+                        pdf_bytes=pdf_bytes,
+                        pdf_filename=sanitize_filename(pending.metadata.title),
+                        pdf_url=pending.manual_url,
+                        collection_name=pending.collection,
+                        default_collection=self.config.default_collection,
+                        tags=pending.tags + ["pdf-attached"],
+                    )
+                    res = {
+                        "status": "saved",
+                        "item_key": saved.get("item_key"),
+                        "pdf_attached": bool(saved.get("pdf_attached")),
+                        "reason": saved.get("attachment_error", ""),
+                    }
+            except Exception as exc:
+                logger.exception("Paper Bridge inbox scan failed for %s", pending.task_id)
+                errors.append({"task_id": pending.task_id, "error": str(exc) or type(exc).__name__})
                 continue
-            pdf_bytes = pdf_file.read_bytes()
-            if pending.item_key:
-                res = self.zotero.attach_pdf_to_existing(
-                    pending.item_key,
-                    pdf_bytes,
-                    pdf_filename=sanitize_filename(pending.metadata.title),
-                    pdf_url=pending.manual_url,
-                    metadata=pending.metadata,
-                    collection_name=pending.collection,
-                    default_collection=self.config.default_collection,
-                    tags=pending.tags + ["pdf-attached"],
-                )
-            else:
-                saved = self.zotero.save_item(
-                    pending.metadata,
-                    pdf_bytes=pdf_bytes,
-                    pdf_filename=sanitize_filename(pending.metadata.title),
-                    pdf_url=pending.manual_url,
-                    collection_name=pending.collection,
-                    default_collection=self.config.default_collection,
-                    tags=pending.tags + ["pdf-attached"],
-                )
-                res = {
-                    "status": "saved",
-                    "item_key": saved.get("item_key"),
-                    "pdf_attached": bool(saved.get("pdf_attached")),
-                    "reason": saved.get("attachment_error", ""),
-                }
 
             if res.get("pdf_attached"):
-                pending.completed = True
+                with self._lock:
+                    pending.completed = True
+                    pending.completion_status = res["status"]
+                    if pending.batch_id in self._batches:
+                        record = self._batches[pending.batch_id]
+                        for index, result in enumerate(record.results):
+                            if result.get("manual_task_id") == pending.task_id:
+                                record.results[index] = {
+                                    **result,
+                                    "status": res["status"],
+                                    "item_key": res.get("item_key"),
+                                    "reason": res.get("reason", ""),
+                                    "pdf_attached": True,
+                                }
+                                break
+                        self._finish_batch_locked(record)
                 self._archive_inbox_file(pdf_file)
                 attached.append(
                     {
@@ -750,13 +884,15 @@ class PaperBridgeEngine:
                     }
                 )
 
-        remaining = sum(
-            1
-            for p in self._pending_manual.values()
-            if not p.completed and (batch_id is None or p.batch_id == batch_id)
-        )
+        with self._lock:
+            remaining = sum(
+                1
+                for p in self._pending_manual.values()
+                if not p.completed and (batch_id is None or p.batch_id == batch_id)
+            )
         return {
             "attached_count": len(attached),
             "remaining_count": remaining,
             "attached": attached,
+            "errors": errors,
         }

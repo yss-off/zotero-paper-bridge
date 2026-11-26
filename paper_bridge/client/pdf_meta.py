@@ -236,3 +236,9 @@ def extract_pdf_metadata(
         title = ""
     creators = xmp_creators or info_creators
     return ExtractedPdfMetadata(doi=doi, title=title, creators=creators)
+
+
+def declared_pdf_doi(pdf_bytes: bytes) -> str | None:
+    """Read a DOI declared by the PDF's XMP metadata."""
+    doi, _, _ = _extract_xmp_fields(pdf_bytes)
+    return doi

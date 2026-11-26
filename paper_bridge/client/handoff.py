@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import html
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -11,12 +13,11 @@ import webbrowser
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..common.identifiers import normalize_doi, normalize_title
+from ..common.identifiers import normalize_doi
 from ..common.models import PaperMetadata
 from ..common.security import is_safe_http_url
 from .fetcher import is_valid_pdf
-
-INCOMPLETE_SUFFIXES = (".crdownload", ".part", ".tmp", ".download")
+from .pdf_meta import declared_pdf_doi
 
 
 @dataclass
@@ -31,6 +32,7 @@ class PendingManualPaper:
     reason: str
     batch_id: str | None = None
     completed: bool = False
+    completion_status: str = ""
 
 
 def open_in_browser(url: str) -> bool:
@@ -43,33 +45,9 @@ def open_in_browser(url: str) -> bool:
 
 
 def show_desktop_notification(title: str, message: str) -> bool:
-    """Show a native desktop notification on Windows, macOS, or Linux (zero third-party deps)."""
+    """Show a native desktop notification on Linux or macOS (zero third-party deps)."""
     clean_title = " ".join(title.splitlines()).strip()[:120]
     clean_msg = " ".join(message.splitlines()).strip()[:300]
-
-    if os.name == "nt":
-        safe_title = clean_title.replace("'", "''")
-        safe_msg = clean_msg.replace("'", "''")
-        ps_script = (
-            "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null; "
-            "[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null; "
-            "$xml = New-Object Windows.Data.Xml.Dom.XmlDocument; "
-            f"$xml.LoadXml('<toast><visual><binding template=\"ToastText02\"><text id=\"1\">{html.escape(safe_title)}</text><text id=\"2\">{html.escape(safe_msg)}</text></binding></visual></toast>'); "
-            "$toast = New-Object Windows.UI.Notifications.ToastNotification $xml; "
-            "$notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('zotero-paper-bridge'); "
-            "$notifier.Show($toast)"
-        )
-        try:
-            subprocess.run(
-                ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps_script],
-                check=False,
-                timeout=8,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            return True
-        except Exception:
-            return False
 
     if sys.platform == "darwin":
         osa_title = clean_title.replace("\\", "\\\\").replace('"', '\\"')
@@ -107,40 +85,35 @@ def show_desktop_notification(title: str, message: str) -> bool:
     return False
 
 
-# Backward-compatible alias
-show_windows_toast = show_desktop_notification
-
-
 def score_pdf_match(pdf_path: Path, pending: PendingManualPaper) -> float:
     """Score how likely a downloaded PDF file matches a pending paper."""
     stem = pdf_path.stem.lower()
     meta = pending.metadata
 
-    if meta.ieee_arnumber and meta.ieee_arnumber in stem:
-        return 1.0
+    if meta.ieee_arnumber:
+        arnumber = meta.ieee_arnumber.lstrip("0") or meta.ieee_arnumber
+        if re.search(r"(?<!\d)0*" + re.escape(arnumber) + r"(?!\d)", stem):
+            return 1.0
     if meta.arxiv_id:
         base_arxiv = meta.arxiv_id.lower().split("v")[0]
-        if base_arxiv in stem:
+        if re.search(r"(?<!\d)" + re.escape(base_arxiv) + r"(?!\d)", stem):
             return 1.0
     if meta.doi:
         norm_doi = normalize_doi(meta.doi)
         doi_tail = norm_doi.split("/", 1)[-1]
-        if doi_tail and len(doi_tail) >= 6 and doi_tail in stem:
+        if len(doi_tail) >= 6 and re.search(
+            r"(?<![a-z0-9])" + re.escape(doi_tail) + r"(?![a-z0-9])", stem
+        ):
             return 0.95
-
-    norm_stem = normalize_title(pdf_path.stem)
-    norm_title = normalize_title(meta.title)
-    if not norm_stem or not norm_title:
-        return 0.0
-    stem_tokens = [t for t in norm_stem.split() if len(t) >= 3]
-    title_tokens = [t for t in norm_title.split() if len(t) >= 3]
-    if not stem_tokens or not title_tokens:
-        return 0.0
-    overlap = len(set(stem_tokens) & set(title_tokens))
-    ratio = overlap / max(1, min(len(set(stem_tokens)), len(set(title_tokens))))
-    if overlap >= 3 and ratio >= 0.6:
-        return 0.8 + 0.15 * ratio
     return 0.0
+
+
+def _pdf_sha256(path: Path) -> bytes:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.digest()
 
 
 def find_matching_pdf_in_inbox(
@@ -152,10 +125,11 @@ def find_matching_pdf_in_inbox(
 ) -> Path | None:
     if not inbox_dir.exists():
         return None
-    best_path: Path | None = None
+    best_matches: list[tuple[Path, os.stat_result]] = []
     best_score = 0.0
-    for candidate in sorted(inbox_dir.glob("*.pdf"), key=lambda p: p.stat().st_mtime, reverse=True):
-        if candidate.name.lower().endswith(INCOMPLETE_SUFFIXES):
+    expected_doi = normalize_doi(pending.metadata.doi) if pending.metadata.doi else None
+    for candidate in inbox_dir.iterdir():
+        if candidate.suffix.lower() != ".pdf" or candidate.is_symlink():
             continue
         key = str(candidate.resolve())
         if seen_files and key in seen_files:
@@ -169,18 +143,47 @@ def find_matching_pdf_in_inbox(
         if st.st_size < 1024:
             continue
         score = score_pdf_match(candidate, pending)
+        if score < 0.95 and not expected_doi:
+            continue
+        try:
+            with candidate.open("rb") as source:
+                head = source.read(1024 * 1024)
+                if not is_valid_pdf(head):
+                    continue
+                doi = declared_pdf_doi(head) if expected_doi else None
+                if expected_doi and doi is None and st.st_size > len(head):
+                    source.seek(-min(256 * 1024, st.st_size), 2)
+                    doi = declared_pdf_doi(source.read(256 * 1024))
+        except OSError:
+            continue
+        if doi and doi != expected_doi:
+            continue
+        if doi == expected_doi and doi is not None:
+            score = 2.0
+        elif score < 0.95:
+            continue
         if score > best_score:
             best_score = score
-            best_path = candidate
+            best_matches = [(candidate, st)]
+        elif score == best_score:
+            best_matches.append((candidate, st))
 
-    if best_path is not None and best_score >= 0.8:
-        try:
-            data = best_path.read_bytes()
-        except OSError:
+    if not best_matches:
+        return None
+    if len(best_matches) == 1:
+        return best_matches[0][0]
+
+    if len({st.st_size for _, st in best_matches}) > 1:
+        return None
+    try:
+        first_digest = _pdf_sha256(best_matches[0][0])
+        if any(_pdf_sha256(path) != first_digest for path, _ in best_matches[1:]):
             return None
-        if is_valid_pdf(data):
-            return best_path
-    return None
+    except OSError:
+        return None
+
+    newest_path, _ = max(best_matches, key=lambda match: (match[1].st_mtime_ns, match[0].name))
+    return newest_path
 
 
 def render_manual_checklist_html(
@@ -193,8 +196,12 @@ def render_manual_checklist_html(
 ) -> str:
     rows_html: list[str] = []
     for idx, item in enumerate(pending_items, start=1):
-        status_label = "Done / 已完成" if item.completed else "Pending / 待补 PDF"
-        badge_cls = "done" if item.completed else "pending"
+        if item.completion_status == "saved_merge_needed":
+            status_label, badge_cls = "PDF saved / 待合并到原条目", "pending"
+        elif item.completed:
+            status_label, badge_cls = "Done / 已完成", "done"
+        else:
+            status_label, badge_cls = "Pending / 待补 PDF", "pending"
         title_esc = html.escape(item.metadata.title or item.identifier)
         doi_esc = html.escape(item.metadata.doi or "-")
         reason_esc = html.escape(item.reason or "needs_manual")
@@ -242,7 +249,7 @@ def render_manual_checklist_html(
     <strong>Recommended steps (avoids duplicate Zotero items):</strong><br>
     1. Metadata for these papers is already saved in Zotero (tagged <code>needs-pdf</code>).<br>
     2. Click <em>Open Page</em>, complete institutional sign-in or verification in your browser, and download the PDF into: <code>{inbox_esc}</code>.<br>
-    3. Click the button below to automatically attach downloaded PDFs to their existing Zotero items.
+    3. Click the button below to match downloaded PDFs. Attach any unresolved files manually in Zotero.
   </div>
   <p>
     <button class="btn secondary" onclick="scanInbox()">Scan Inbox &amp; Attach PDFs / 扫描下载目录并自动补挂</button>

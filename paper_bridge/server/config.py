@@ -1,4 +1,4 @@
-"""Configuration loader for the Ubuntu server CLI."""
+"""Configuration loader for the `paper-bridge` CLI."""
 
 from __future__ import annotations
 
@@ -14,18 +14,18 @@ except ModuleNotFoundError:  # pragma: no cover
 
 
 DEFAULT_SERVER_CONFIG_TOML = """\
-# zotero-paper-bridge Ubuntu server CLI configuration
-# Preferred Unix socket path forwarded from Windows via ssh -R (inside a chmod 700 dir)
+# zotero-paper-bridge CLI configuration (local Unix socket mode)
+# Private Unix socket served by `paper-bridge-helper` inside a chmod 700 directory
 socket_path = "~/.local/run/paper-bridge/helper.sock"
 
-# Fallback loopback URL if sshd on this host does not allow Unix socket forwarding
+# Optional loopback TCP fallback URL (leave empty to use the private Unix socket only)
 # Bearer Token authentication is ALWAYS required on both Unix socket and TCP!
-tcp_base_url = "http://127.0.0.1:18765"
+tcp_base_url = ""
 
 # Default target collection in Zotero when --collection is omitted
 default_collection = "Agent-Inbox"
 
-# Default HTTP timeout for single requests (single browser handoff can take up to 5 min)
+# Default HTTP timeout for single requests
 request_timeout_sec = 320.0
 health_timeout_sec = 5.0
 """
@@ -61,7 +61,7 @@ class ServerConfig:
     token_path: Path
     queue_path: Path
     socket_path: Path
-    tcp_base_url: str = "http://127.0.0.1:18765"
+    tcp_base_url: str = ""
     default_collection: str = "Agent-Inbox"
     request_timeout_sec: float = 320.0
     health_timeout_sec: float = 5.0
@@ -104,7 +104,9 @@ class ServerConfig:
             token_path=tok_path,
             queue_path=q_path,
             socket_path=sock_path,
-            tcp_base_url=str(raw.get("tcp_base_url", "http://127.0.0.1:18765")).rstrip("/"),
+            tcp_base_url=(
+                os.environ.get("PAPER_BRIDGE_TCP_URL") or str(raw.get("tcp_base_url", ""))
+            ).rstrip("/"),
             default_collection=str(raw.get("default_collection", "Agent-Inbox")),
             request_timeout_sec=float(raw.get("request_timeout_sec", 320.0)),
             health_timeout_sec=float(raw.get("health_timeout_sec", 5.0)),

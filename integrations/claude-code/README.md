@@ -1,6 +1,6 @@
 # Claude Code Integration
 
-## 1. Install `zotero-paper-bridge` on your remote Linux server
+## 1. Install `zotero-paper-bridge` on your Linux host (with local Zotero 7)
 
 ```bash
 ./scripts/install-server.sh --no-antigravity
@@ -9,7 +9,7 @@
 ## 2. Register the private read-only Zotero MCP server
 
 ```bash
-claude mcp add zotero -- "$HOME/.local/bin/zotero-mcp-paper-bridge"
+claude mcp add zotero -e ZOTERO_LOCAL=true -- "$HOME/.local/bin/zotero-mcp-paper-bridge"
 ```
 
 ## 3. (Optional) Add the Skill to Claude Code
